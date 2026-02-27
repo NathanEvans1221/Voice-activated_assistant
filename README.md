@@ -103,6 +103,17 @@ ggml-tiny-zh_tw.bin 模型下載網址:
 https://huggingface.co/xmzhu/whisper-tiny-zh-TW/blob/a41e6c9470161b8aa876bd085c780f2396e80164/ggml-tiny-zh_tw.bin
 - 74 MB
 
+## 平台相容性說明
+
+本專案目前**僅支援 Windows 作業系統**，無法在 macOS 或 Linux 上直接執行。主要原因如下：
+
+1. **語音錄製 (Audio Recording)**：採用了 `NAudio` 庫，其核心底層依賴於 Windows 獨有的 **WASAPI** 與 **WinMM** API。
+2. **語音合成 (TTS)**：採用了 `System.Speech` 庫，這是基於 Windows 內建的 **SAPI (Speech API)** 引擎。
+3. **專案目標**：目前的專案檔 (`.csproj`) 鎖定為 `net10.0-windows`，以確保能與上述 Windows 原生組件深度整合並達成低延遲效能。
+
+> [!NOTE]
+> 雖然 .NET 10 本身是跨平台的，但若要移植至 macOS，需更換錄音庫（如 CoreAudio 適配層）及 TTS 引擎（如 AVSpeechSynthesizer 介接）。
+
 ## .NET 10 升級說明
 本專案已從 .NET 6 升級至 **.NET 10**，主要變更包含：
 
