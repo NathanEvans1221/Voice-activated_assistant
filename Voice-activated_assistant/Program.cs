@@ -11,6 +11,8 @@ using Voice_activated_assistant;
 using Whisper.net;
 using Whisper.net.Ggml;
 using System.Speech.Synthesis;
+using System.Text.Json;
+using System.Collections.Generic;
 
 // 指定輸出為 UTF8
 Console.OutputEncoding = System.Text.Encoding.UTF8;
@@ -87,9 +89,9 @@ using var whisperFactory = WhisperFactory.FromPath(modelName);
 using var processor = whisperFactory.CreateBuilder()
     .WithLanguage("zh") 
     .WithPrompt("你好。嗨。請問有什麼事嗎？") 
-    .WithTemperature(0.0f) // 關閉隨機性，讓模型更保守，降低幻覺
-    .WithNoSpeechThreshold(0.6f) // 若偵測為「非語音」機率 > 0.6，則不予轉譯
-    .WithLogProbThreshold(-1.0f) // 過濾掉信心程度過低的結果
+    .WithTemperature(0.0f) 
+    .WithNoSpeechThreshold(0.6f) 
+    .WithLogProbThreshold(-1.0f) 
     .WithThreads(Environment.ProcessorCount)
     .Build();
 
@@ -108,26 +110,50 @@ string readyMsg = "程式準備完畢，請說話！";
 Console.WriteLine($"\n✅ {readyMsg}\n");
 synth.Speak(readyMsg); // 使用同步播放，確保說完才進入監聽迴圈
 
+// 讀取關鍵字回應表
+Dictionary<string, string> keywordResponses = new();
+string configPath = "keyword_responses.json";
+if (File.Exists(configPath))
+{
+    try 
+    {
+        string json = File.ReadAllText(configPath);
+        keywordResponses = JsonSerializer.Deserialize<Dictionary<string, string>>(json) ?? new();
+        Console.WriteLine($"📊 已載入 {keywordResponses.Count} 筆關鍵字回應設定。");
+    }
+    catch (Exception ex) { Console.WriteLine($"⚠️ 載入設定表失敗: {ex.Message}"); }
+}
+
+// 用於按順序排隊轉譯任務，但不阻塞錄音
+var transcriptionQueue = Task.CompletedTask;
+
 while (isRunning)
 {
     // 檢查 TTS 是否正在說話，若是則等待（防止錄到自己的聲音）
     while (synth.State == SynthesizerState.Speaking)
     {
-        await Task.Delay(500);
+        await Task.Delay(200);
     }
 
     recorder.StartRecording();
     
-    int maxWaitMs = 15000; // 恢復為較長的監聽上限
+    int maxWaitMs = 15000; 
     int waitedMs = 0;
     while (waitedMs < maxWaitMs)
     {
+        // 核心保護：如果正在監聽時，背景任務啟動了 TTS 回話，則立即斷開錄音避免回授
+        if (synth.State == SynthesizerState.Speaking)
+        {
+            Console.WriteLine("\n🔇 偵測到助理回話，暫時停止監聽並重新計時...");
+            break;
+        }
+
         int elapsedSeconds = waitedMs / 1000;
         Console.Write($"\r🎙️  監聽中 ({elapsedSeconds}s)...".PadRight(20));
 
         if (recorder.ShouldStopDueToSilence()) 
         {
-            Console.WriteLine("\n🛑 偵測到停頓，處理中...");
+            Console.WriteLine("\n🛑 偵測到停頓，派發辨識中...");
             break;
         }
         await Task.Delay(100);
@@ -139,23 +165,53 @@ while (isRunning)
             break;
         }
     }
+    
     recorder.StopRecording();
-
     if (!isRunning) break;
 
-    using var audioStream = recorder.GetAudioStream();
+    // 獲取音訊流副本 (AudioRecorder 已實作製作獨立副本)
+    var audioStream = recorder.GetAudioStream();
     if (audioStream != null && audioStream.Length > 0)
     {
-        Console.WriteLine("\r⚙️  轉譯中...".PadRight(20));
-        await foreach (var result in processor.ProcessAsync(audioStream))
+        // 核心優化：將轉譯工作交給背景隊列，主執行緒立即回到迴圈開始下一段錄製
+        transcriptionQueue = transcriptionQueue.ContinueWith(async _ => 
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {result.Text}");
-        }
-        
-        // 轉譯完成後主動釋放記憶體，適合長駐執行
-        GC.Collect(1);
+            try 
+            {
+                using (audioStream)
+                {
+                    await foreach (var result in processor.ProcessAsync(audioStream))
+                    {
+                        if (!string.IsNullOrWhiteSpace(result.Text))
+                        {
+                            Console.WriteLine($"\n[{DateTime.Now:HH:mm:ss}] {result.Text}");
+                            
+                            // 關鍵字檢索與 TTS 回應
+                            foreach (var kvp in keywordResponses)
+                            {
+                                if (result.Text.Contains(kvp.Key))
+                                {
+                                    string finalResponse = kvp.Value.Replace("{TIME}", DateTime.Now.ToString("HH:mm"));
+                                    Console.WriteLine($"🤖 [關鍵字觸發] 「{kvp.Key}」 -> {finalResponse}");
+                                    synth.SpeakAsync(finalResponse);
+                                    break; // 每次對話只觸發一個關鍵字
+                                }
+                            }
+                        }
+                    }
+                }
+                GC.Collect(1);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"\n❌ 背景轉譯發生錯誤: {ex.Message}");
+            }
+        }).Unwrap();
     }
 }
+
+// 結束前確保最後一段轉譯有跑完
+await transcriptionQueue;
 
 Console.WriteLine("✅ 程式已結束!");
 Console.ReadLine();

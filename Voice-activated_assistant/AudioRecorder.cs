@@ -12,13 +12,14 @@ namespace Voice_activated_assistant
         private readonly MemoryStream memoryStream = new MemoryStream();
         private bool isRecording = false;
         private bool isSpeaking = false;
-        private readonly float threshold = 0.008f; // 稍微調高一些，過濾更微弱的環境底噪
+        private float threshold = 0.005f; // 起始門檻，會隨環境自動調整
+        private float noiseFloor = 0.002f; // 環境底噪
         private DateTime lastVoiceTime = DateTime.MinValue;
-        private readonly int silenceDurationMs = 1500;
+        private readonly int silenceDurationMs = 900; // 縮短為 0.9 秒，提升反應速度
 
-        // 預錄緩衝區：保存觸發前約 400ms 的音訊 (確保起手字完整)
+        // 預錄緩衝區：保存觸發前約 600ms 的音訊 (確保起手字完整)
         private readonly List<byte[]> preRollBuffer = new List<byte[]>();
-        private readonly int maxPreRollBlocks = 20; 
+        private readonly int maxPreRollBlocks = 30; 
 
         public AudioRecorder()
         {
@@ -45,62 +46,73 @@ namespace Voice_activated_assistant
             preRollBuffer.Clear();
         }
 
+        private int voiceConfirmCount = 0; // 用於確認是否為持續的人聲而非突發雜訊
+
         private void WaveSource_DataAvailable(object? sender, WaveInEventArgs e)
         {
             if (!isRecording) return;
 
-            float amplitude = 0;
-            for (int index = 0; index < e.BytesRecorded; index += 2) // 全量掃描以提高精準度
+            float maxAmplitude = 0;
+            float sumAmplitude = 0;
+            for (int index = 0; index < e.BytesRecorded; index += 2)
             {
                 short sample = BitConverter.ToInt16(e.Buffer, index);
-                amplitude += Math.Abs(sample / 32768f);
+                float absSample = Math.Abs(sample / 32768f);
+                if (absSample > maxAmplitude) maxAmplitude = absSample;
+                sumAmplitude += absSample;
             }
-            amplitude /= (e.BytesRecorded / 2);
+            float avgAmplitude = sumAmplitude / (e.BytesRecorded / 2);
 
-            // 如果有人正在說話，可以取消註解下一行來觀察音控數值
-            // Console.Write($"\r音量: {amplitude:F4} ".PadRight(20));
-
-            if (amplitude > threshold)
+            // 動態調整底噪：在沒人說話時，學習環境音
+            if (!isSpeaking)
             {
-                lastVoiceTime = DateTime.Now;
-                if (!isSpeaking)
+                noiseFloor = (noiseFloor * 0.98f) + (avgAmplitude * 0.02f); // 更緩慢、穩定的學習
+                threshold = Math.Max(0.012f, noiseFloor * 2.0f + 0.005f); // 拉開門檻，底噪的兩倍再加上一個基本偏移，過濾雜訊
+            }
+
+            // 必須同時滿足：1. 峰值超過門檻 2. 平均能量也要有一定的水平
+            if (maxAmplitude > threshold && avgAmplitude > threshold * 0.3f)
+            {
+                voiceConfirmCount++;
+                
+                // 需要連續 2 個 block (約 80ms) 都偵測到聲音，才判定為「正在說話」
+                if (voiceConfirmCount >= 2)
                 {
-                    isSpeaking = true;
-                    Console.WriteLine("\n🎤 偵測到聲音...");
-                    
-                    lock (memoryStream)
+                    lastVoiceTime = DateTime.Now;
+                    if (!isSpeaking)
                     {
-                        if (waveFile == null)
+                        isSpeaking = true;
+                        Console.WriteLine("\n🎤 偵測到聲音 (穩定)...");
+                        
+                        lock (memoryStream)
                         {
-                            waveFile = new WaveFileWriter(new IgnoreDisposeStream(memoryStream), waveSource!.WaveFormat);
-                            // 寫入預錄段，確保開頭完整
-                            foreach (var block in preRollBuffer)
+                            if (waveFile == null)
                             {
-                                waveFile.Write(block, 0, block.Length);
+                                waveFile = new WaveFileWriter(new IgnoreDisposeStream(memoryStream), waveSource!.WaveFormat);
+                                foreach (var block in preRollBuffer)
+                                {
+                                    waveFile.Write(block, 0, block.Length);
+                                }
+                                preRollBuffer.Clear();
                             }
-                            preRollBuffer.Clear();
                         }
                     }
-                }
-
-                lock (memoryStream)
-                {
-                    waveFile?.Write(e.Buffer, 0, e.BytesRecorded);
                 }
             }
             else
             {
-                if (isSpeaking)
-                {
-                    // 說話中但暫時短暫低於門檻，持續錄音
-                    lock (memoryStream) { waveFile?.Write(e.Buffer, 0, e.BytesRecorded); }
-                }
-                else
-                {
-                    // 尚未觸發說話，將當前段存入預錄衝緩
-                    preRollBuffer.Add(e.Buffer.ToArray());
-                    if (preRollBuffer.Count > maxPreRollBlocks) preRollBuffer.RemoveAt(0);
-                }
+                voiceConfirmCount = 0; // 一旦中斷就重算，過濾突發性的快響 (如滑鼠點擊)
+            }
+
+            // 如果已經判定為說話中，則無論音量大小都持續錄音，直到停頓偵測發動
+            if (isSpeaking)
+            {
+                lock (memoryStream) { waveFile?.Write(e.Buffer, 0, e.BytesRecorded); }
+            }
+            else
+            {
+                preRollBuffer.Add(e.Buffer.ToArray());
+                if (preRollBuffer.Count > maxPreRollBlocks) preRollBuffer.RemoveAt(0);
             }
         }
 
